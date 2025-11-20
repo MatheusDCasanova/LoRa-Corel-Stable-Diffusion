@@ -1,0 +1,13 @@
+torch
+torchvision
+diffusers
+transformers
+accelerate
+datasets
+peft
+bitsandbytes
+xformers
+safetensors
+pillow
+tqdm
+huggingface-hub
