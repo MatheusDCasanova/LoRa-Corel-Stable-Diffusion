@@ -60,6 +60,7 @@ def main():
         gradient_accumulation_steps=gradient_accumulation_steps, mixed_precision="fp16"
     )
     device = accelerator.device
+    print(f"Using device: {device}")
 
     # Load scheduler, tokenizer and unet models.
     noise_scheduler = DDPMScheduler.from_pretrained(
