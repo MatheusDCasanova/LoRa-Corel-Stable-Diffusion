@@ -23,7 +23,7 @@ else:
 # --- CONFIGURAÇÃO DE GERAÇÃO ---
 # Lista de classes da Corel que você quer testar.
 # Devem ser iguais aos nomes das pastas usados no treino.
-classes_to_test = ["beach", "bus", "dinosaur", "elephants", "flower"]
+classes_to_test = ["royal guards", "train", "dessert", "vegetables", "snow", "sunset"]
 
 NUM_IMAGES_PER_CLASS = 2
 WIDTH = 512  # Corel geralmente fica melhor em 512 do que 256
