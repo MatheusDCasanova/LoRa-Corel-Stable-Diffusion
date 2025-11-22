@@ -263,6 +263,9 @@ class DiffusionSchedule:
         
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        self.posterior_variance = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        )
     
     def _cosine_beta_schedule(self, timesteps, s=0.008):
         steps = timesteps + 1
