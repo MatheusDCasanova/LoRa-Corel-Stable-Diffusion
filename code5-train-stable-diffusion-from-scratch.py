@@ -2,6 +2,7 @@
 Stable Diffusion - Latent Space Diffusion Model
 ================================================
 Updated for Corel Dataset & Accelerate
+Synced with Improved VAE Architecture
 
 This code trains a diffusion model in the latent space of a pre-trained VAE.
 It loads the encoder and decoder from code4-train-vae.py and applies diffusion
@@ -36,21 +37,68 @@ import argparse
 # VAE COMPONENTS (Matching code4-train-vae.py)
 # ============================================================================
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
+class AttnBlock(nn.Module):
+    """Self-Attention Block"""
+    def __init__(self, in_channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.relu = nn.LeakyReLU(0.2)
+        self.in_channels = in_channels
+        
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         
     def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return self.relu(out)
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+        
+        # Compute attention
+        b, c, h, w = q.shape
+        q = q.reshape(b, c, h*w)
+        q = q.permute(0, 2, 1)   # b,hw,c
+        k = k.reshape(b, c, h*w) # b,c,hw
+        w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        w_ = w_ * (int(c)**(-0.5))
+        w_ = torch.nn.functional.softmax(w_, dim=2)
+        
+        # Attend to values
+        v = v.reshape(b, c, h*w)
+        w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
+        h_ = torch.bmm(v, w_)      # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        h_ = h_.reshape(b, c, h, w)
+        
+        h_ = self.proj_out(h_)
+        
+        return x + h_
+
+class ResidualBlock(nn.Module):
+    """Modern Residual Block with GroupNorm and SiLU"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.act = nn.SiLU()
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.shortcut = nn.Identity()
+        
+    def forward(self, x):
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        h = self.act(self.norm2(h))
+        h = self.conv2(h)
+        return h + self.shortcut(x)
 
 class Encoder(nn.Module):
     def __init__(self, config):
@@ -60,23 +108,43 @@ class Encoder(nn.Module):
         layers = []
         in_channels = config.image_channels
         
-        for h_dim in config.hidden_dims:
-            layers.append(nn.Sequential(
-                nn.Conv2d(in_channels, h_dim, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(h_dim),
-                nn.LeakyReLU(0.2),
-                ResidualBlock(h_dim),
-            ))
+        # Initial conv
+        layers.append(nn.Conv2d(in_channels, config.hidden_dims[0], 3, padding=1))
+        in_channels = config.hidden_dims[0]
+        
+        # Downsampling blocks
+        for i, h_dim in enumerate(config.hidden_dims):
+            # Residual blocks
+            layers.append(ResidualBlock(in_channels, h_dim))
+            layers.append(ResidualBlock(h_dim, h_dim))
+            
+            # Downsample (except last if we want, but here we downsample every time)
+            # Stride 2 conv for downsampling
+            if i < len(config.hidden_dims):
+                layers.append(nn.Conv2d(h_dim, h_dim, 3, stride=2, padding=1))
+            
+            # Attention at lowest resolution (bottleneck)
+            if i == len(config.hidden_dims) - 1:
+                layers.append(AttnBlock(h_dim))
+                
             in_channels = h_dim
         
         self.encoder = nn.Sequential(*layers)
         
+        # Calculate final size
+        # We did len(hidden_dims) downsamples
         self.final_size = config.image_size // (2 ** len(config.hidden_dims))
         self.final_channels = config.hidden_dims[-1]
         flatten_dim = self.final_channels * self.final_size * self.final_size
         
         self.fc_mu = nn.Linear(flatten_dim, config.latent_dim)
         self.fc_logvar = nn.Linear(flatten_dim, config.latent_dim)
+        
+        # Init
+        nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
+        nn.init.zeros_(self.fc_mu.bias)
+        nn.init.xavier_normal_(self.fc_logvar.weight, gain=0.01)
+        nn.init.constant_(self.fc_logvar.bias, -3.0)
     
     def forward(self, x):
         h = self.encoder(x)
@@ -99,21 +167,25 @@ class Decoder(nn.Module):
         layers = []
         reversed_dims = list(reversed(config.hidden_dims))
         
-        for i in range(len(reversed_dims) - 1):
-            layers.append(nn.Sequential(
-                ResidualBlock(reversed_dims[i]),
-                nn.Conv2d(reversed_dims[i], reversed_dims[i+1] * 4, 3, padding=1),
-                nn.PixelShuffle(2),
-                nn.BatchNorm2d(reversed_dims[i+1]),
-                nn.LeakyReLU(0.2),
-            ))
+        # Start with attention
+        layers.append(AttnBlock(reversed_dims[0]))
         
-        layers.append(nn.Sequential(
-            ResidualBlock(reversed_dims[-1]),
-            nn.Conv2d(reversed_dims[-1], config.image_channels * 4, 3, padding=1),
-            nn.PixelShuffle(2),
-            nn.Tanh()
-        ))
+        for i in range(len(reversed_dims)):
+            h_dim = reversed_dims[i]
+            next_dim = reversed_dims[i+1] if i < len(reversed_dims) - 1 else reversed_dims[-1]
+            
+            layers.append(ResidualBlock(h_dim, h_dim))
+            layers.append(ResidualBlock(h_dim, h_dim))
+            
+            # Upsample
+            layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            layers.append(nn.Conv2d(h_dim, next_dim if i < len(reversed_dims)-1 else h_dim, 3, padding=1))
+            
+        # Final output
+        layers.append(nn.GroupNorm(32, reversed_dims[-1]))
+        layers.append(nn.SiLU())
+        layers.append(nn.Conv2d(reversed_dims[-1], config.image_channels, 3, padding=1))
+        layers.append(nn.Tanh())
         
         self.decoder = nn.Sequential(*layers)
     

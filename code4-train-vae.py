@@ -4,11 +4,12 @@
 Clean VAE - No k-NN Complexity
 ================================
 Updated for Corel Dataset & Accelerate
+IMPROVED ARCHITECTURE: GroupNorm, SiLU, Attention, Low KL
 
 Focuses on what actually works:
-- Proper KL control
+- Proper KL control (Low KL for reconstruction focus)
 - Perceptual loss for sharpness
-- Good architecture
+- Modern Architecture (GN + SiLU + Attention)
 - Simple and fast
 - Multi-device support via Accelerate
 """
@@ -31,7 +32,7 @@ from accelerate.utils import set_seed
 
 # --- CONFIG ---
 class Config:
-    data_dir = "./corel"  # Updated default
+    data_dir = "./corel"
     output_dir = "./vae_clean"
     image_size = 128
     image_channels = 3
@@ -41,22 +42,22 @@ class Config:
     batch_size = 16
     learning_rate = 1e-4
     
-    # KL control
-    kl_weight_final = 1.0
-    kl_warmup_epochs = 150
-    kl_target = 25.0
+    # KL control (DRASTICALLY REDUCED for better reconstruction)
+    kl_weight_final = 0.00001  # 1e-5
+    kl_warmup_epochs = 50
+    kl_target = None # Not used with fixed small weight
     
     # Perceptual loss
     use_perceptual = True
-    perceptual_weight = 0.03
+    perceptual_weight = 0.1  # Increased slightly
     
     weight_decay = 1e-5
     grad_clip = 1.0
-    num_workers = 4
+    num_workers = 8
     save_every = 20
     sample_every = 10
     seed = 42
-    mixed_precision = "fp16"  # accelerate handles this
+    mixed_precision = "fp16"
 
 config = Config()
 
@@ -67,14 +68,12 @@ class SimpleDataset(Dataset):
         self.image_size = image_size
         
         self.image_paths = []
-        # Case insensitive search for images
         extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp']
         for ext in extensions:
             self.image_paths.extend(list(self.data_dir.rglob(ext)))
             self.image_paths.extend(list(self.data_dir.rglob(ext.upper())))
         
         if len(self.image_paths) == 0:
-            # Fallback: try to find images in subfolders if not found directly
             print(f"Warning: No images found in {data_dir} with standard extensions. Checking recursively...")
             
         print(f"✓ Found {len(self.image_paths)} images in {data_dir}")
@@ -98,7 +97,6 @@ class SimpleDataset(Dataset):
             return self.transform(image)
         except Exception as e:
             print(f"Error loading image {img_path}: {e}")
-            # Return a black image in case of error to prevent crash
             return torch.zeros((3, self.image_size, self.image_size))
 
 # --- MODELS ---
@@ -124,21 +122,68 @@ class PerceptualLoss(nn.Module):
         y_features = self.feature_extractor(y_norm)
         return F.mse_loss(x_features, y_features)
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
+class AttnBlock(nn.Module):
+    """Self-Attention Block"""
+    def __init__(self, in_channels):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-        self.relu = nn.LeakyReLU(0.2)
+        self.in_channels = in_channels
+        
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         
     def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        return self.relu(out)
+        h_ = x
+        h_ = self.norm(h_)
+        q = self.q(h_)
+        k = self.k(h_)
+        v = self.v(h_)
+        
+        # Compute attention
+        b, c, h, w = q.shape
+        q = q.reshape(b, c, h*w)
+        q = q.permute(0, 2, 1)   # b,hw,c
+        k = k.reshape(b, c, h*w) # b,c,hw
+        w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
+        w_ = w_ * (int(c)**(-0.5))
+        w_ = torch.nn.functional.softmax(w_, dim=2)
+        
+        # Attend to values
+        v = v.reshape(b, c, h*w)
+        w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
+        h_ = torch.bmm(v, w_)      # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
+        h_ = h_.reshape(b, c, h, w)
+        
+        h_ = self.proj_out(h_)
+        
+        return x + h_
+
+class ResidualBlock(nn.Module):
+    """Modern Residual Block with GroupNorm and SiLU"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.act = nn.SiLU()
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.shortcut = nn.Identity()
+        
+    def forward(self, x):
+        h = self.act(self.norm1(x))
+        h = self.conv1(h)
+        h = self.act(self.norm2(h))
+        h = self.conv2(h)
+        return h + self.shortcut(x)
 
 class Encoder(nn.Module):
     def __init__(self, config):
@@ -148,17 +193,31 @@ class Encoder(nn.Module):
         layers = []
         in_channels = config.image_channels
         
-        for h_dim in config.hidden_dims:
-            layers.append(nn.Sequential(
-                nn.Conv2d(in_channels, h_dim, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(h_dim),
-                nn.LeakyReLU(0.2),
-                ResidualBlock(h_dim),
-            ))
+        # Initial conv
+        layers.append(nn.Conv2d(in_channels, config.hidden_dims[0], 3, padding=1))
+        in_channels = config.hidden_dims[0]
+        
+        # Downsampling blocks
+        for i, h_dim in enumerate(config.hidden_dims):
+            # Residual blocks
+            layers.append(ResidualBlock(in_channels, h_dim))
+            layers.append(ResidualBlock(h_dim, h_dim))
+            
+            # Downsample (except last if we want, but here we downsample every time)
+            # Stride 2 conv for downsampling
+            if i < len(config.hidden_dims):
+                layers.append(nn.Conv2d(h_dim, h_dim, 3, stride=2, padding=1))
+            
+            # Attention at lowest resolution (bottleneck)
+            if i == len(config.hidden_dims) - 1:
+                layers.append(AttnBlock(h_dim))
+                
             in_channels = h_dim
         
         self.encoder = nn.Sequential(*layers)
         
+        # Calculate final size
+        # We did len(hidden_dims) downsamples
         self.final_size = config.image_size // (2 ** len(config.hidden_dims))
         self.final_channels = config.hidden_dims[-1]
         flatten_dim = self.final_channels * self.final_size * self.final_size
@@ -166,9 +225,9 @@ class Encoder(nn.Module):
         self.fc_mu = nn.Linear(flatten_dim, config.latent_dim)
         self.fc_logvar = nn.Linear(flatten_dim, config.latent_dim)
         
+        # Init
         nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
         nn.init.zeros_(self.fc_mu.bias)
-        
         nn.init.xavier_normal_(self.fc_logvar.weight, gain=0.01)
         nn.init.constant_(self.fc_logvar.bias, -3.0)
     
@@ -193,21 +252,25 @@ class Decoder(nn.Module):
         layers = []
         reversed_dims = list(reversed(config.hidden_dims))
         
-        for i in range(len(reversed_dims) - 1):
-            layers.append(nn.Sequential(
-                ResidualBlock(reversed_dims[i]),
-                nn.Conv2d(reversed_dims[i], reversed_dims[i+1] * 4, 3, padding=1),
-                nn.PixelShuffle(2),
-                nn.BatchNorm2d(reversed_dims[i+1]),
-                nn.LeakyReLU(0.2),
-            ))
+        # Start with attention
+        layers.append(AttnBlock(reversed_dims[0]))
         
-        layers.append(nn.Sequential(
-            ResidualBlock(reversed_dims[-1]),
-            nn.Conv2d(reversed_dims[-1], config.image_channels * 4, 3, padding=1),
-            nn.PixelShuffle(2),
-            nn.Tanh()
-        ))
+        for i in range(len(reversed_dims)):
+            h_dim = reversed_dims[i]
+            next_dim = reversed_dims[i+1] if i < len(reversed_dims) - 1 else reversed_dims[-1]
+            
+            layers.append(ResidualBlock(h_dim, h_dim))
+            layers.append(ResidualBlock(h_dim, h_dim))
+            
+            # Upsample
+            layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            layers.append(nn.Conv2d(h_dim, next_dim if i < len(reversed_dims)-1 else h_dim, 3, padding=1))
+            
+        # Final output
+        layers.append(nn.GroupNorm(32, reversed_dims[-1]))
+        layers.append(nn.SiLU())
+        layers.append(nn.Conv2d(reversed_dims[-1], config.image_channels, 3, padding=1))
+        layers.append(nn.Tanh())
         
         self.decoder = nn.Sequential(*layers)
     
@@ -248,7 +311,8 @@ class CleanVAE(nn.Module):
 
 # --- LOSS & TRAINING ---
 def vae_loss(recon_x, x, mu, logvar, model, beta=1.0):
-    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    # L1 Loss for sharper images
+    recon_loss = F.l1_loss(recon_x, x, reduction='mean')
     
     if model.config.use_perceptual:
         perceptual = model.perceptual_loss(recon_x, x)
@@ -264,10 +328,8 @@ def vae_loss(recon_x, x, mu, logvar, model, beta=1.0):
     return total_loss, recon_loss, kl_div, perceptual
 
 def get_kl_weight(epoch, current_kl, config):
-    if epoch < config.kl_warmup_epochs:
-        return config.kl_weight_final * (epoch / config.kl_warmup_epochs)
-    else:
-        return config.kl_weight_final
+    # Fixed small weight is better for reconstruction quality
+    return config.kl_weight_final
 
 def train_epoch(model, dataloader, optimizer, config, epoch, kl_history, accelerator):
     model.train()
@@ -283,7 +345,6 @@ def train_epoch(model, dataloader, optimizer, config, epoch, kl_history, acceler
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}", disable=not accelerator.is_local_main_process)
     
     for data in pbar:
-        # data is already on device thanks to accelerate
         optimizer.zero_grad()
         
         recon, mu, logvar = model(data)
@@ -317,7 +378,6 @@ def train_epoch(model, dataloader, optimizer, config, epoch, kl_history, acceler
 @torch.no_grad()
 def generate_samples(model, epoch, output_dir, accelerator, num_samples=16):
     model.eval()
-    # Use accelerator device
     z = torch.randn(num_samples, model.latent_dim, device=accelerator.device)
     samples = model.decode(z)
     
@@ -330,7 +390,6 @@ def generate_samples(model, epoch, output_dir, accelerator, num_samples=16):
 @torch.no_grad()
 def visualize_reconstruction(model, dataloader, epoch, output_dir, accelerator, num_images=8):
     model.eval()
-    # Get a batch
     data = next(iter(dataloader))[:num_images]
     recon, mu, logvar = model(data)
     
@@ -353,9 +412,7 @@ def plot_losses(losses, output_dir, config):
     axes[0, 1].grid(True)
     
     axes[1, 0].plot(losses['kl'])
-    axes[1, 0].axhline(y=config.kl_target, color='g', linestyle='--', label='Target')
     axes[1, 0].set_title('KL Divergence')
-    axes[1, 0].legend()
     axes[1, 0].grid(True)
     
     axes[1, 1].plot(losses['perceptual'])
@@ -374,11 +431,11 @@ def main():
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--latent-dim', type=int, default=128)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
-    parser.add_argument('--kl-weight', type=float, default=0.01)
+    parser.add_argument('--kl-weight', type=float, default=0.00001)
     parser.add_argument('--kl-warmup', type=int, default=50)
     parser.add_argument('--kl-target', type=float, default=25.0)
     parser.add_argument('--no-perceptual', action='store_true')
-    parser.add_argument('--perceptual-weight', type=float, default=0.05)
+    parser.add_argument('--perceptual-weight', type=float, default=0.1)
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--output-dir', type=str, default='./vae_clean')
     parser.add_argument('--seed', type=int, default=42)
@@ -387,7 +444,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Update config
     config.data_dir = args.data_dir
     config.num_epochs = args.epochs
     config.batch_size = args.batch_size
@@ -403,29 +459,25 @@ def main():
     config.save_every = args.save_every
     config.sample_every = args.sample_every
     
-    # Initialize Accelerator
     accelerator = Accelerator(mixed_precision="fp16")
     set_seed(config.seed)
     
     if accelerator.is_main_process:
         print("="*80)
-        print("CLEAN VAE - ACCELERATE & COREL")
+        print("CLEAN VAE - IMPROVED ARCHITECTURE")
         print("="*80)
         print(f"Device:          {accelerator.device}")
         print(f"Data:            {config.data_dir}")
-        print(f"Latent dim:      {config.latent_dim}")
-        print(f"KL target:       {config.kl_target}")
+        print(f"KL weight:       {config.kl_weight_final}")
         print(f"Perceptual:      {'YES' if config.use_perceptual else 'NO'}")
-        print(f"Epochs:          {config.num_epochs}")
         print("="*80 + "\n")
         
         os.makedirs(config.output_dir, exist_ok=True)
     
-    # Dataset & Dataloader
     dataset = SimpleDataset(config.data_dir, config.image_size)
     if len(dataset) == 0:
         if accelerator.is_main_process:
-            print("ERROR: No images found. Please check data directory.")
+            print("ERROR: No images found.")
         return
 
     dataloader = DataLoader(
@@ -435,17 +487,11 @@ def main():
         drop_last=True
     )
     
-    if accelerator.is_main_process:
-        print(f"✓ Dataset: {len(dataset)} images\n")
-    
-    # Model setup
     model = CleanVAE(config)
     
-    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, 
                                  weight_decay=config.weight_decay)
     
-    # Prepare with Accelerate
     model, optimizer, dataloader = accelerator.prepare(
         model, optimizer, dataloader
     )
@@ -458,13 +504,7 @@ def main():
     if args.resume:
         if accelerator.is_main_process:
             print(f"Loading: {args.resume}")
-        # Use accelerator to load
-        # Note: Standard torch.load is fine for simple resumption if we map location
         checkpoint = torch.load(args.resume, map_location='cpu')
-        
-        # Unwrap model to load state dict if needed, but usually direct load works if keys match
-        # accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
-        # Better to use standard loading and let accelerate handle device placement
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch']
@@ -474,16 +514,13 @@ def main():
             print(f"✓ Resumed from epoch {start_epoch}\n")
     
     if accelerator.is_main_process:
-        print("="*80)
         print("Training...")
-        print("="*80 + "\n")
     
     for epoch in range(start_epoch, config.num_epochs):
         avg_loss, avg_recon, avg_kl, beta, avg_perc = train_epoch(
             model, dataloader, optimizer, config, epoch, kl_history, accelerator
         )
         
-        # Only main process logs and saves
         if accelerator.is_main_process:
             kl_history.append(avg_kl)
             losses['total'].append(avg_loss)
@@ -492,15 +529,12 @@ def main():
             losses['beta'].append(beta)
             losses['perceptual'].append(avg_perc)
             
-            kl_status = "✓" if abs(avg_kl - config.kl_target) <= 10 else "⚠"
-            
             print(f"\nEpoch {epoch+1}:")
             print(f"  Loss:  {avg_loss:.4f}")
             print(f"  Recon: {avg_recon:.4f}")
             print(f"  Perc:  {avg_perc:.4f}")
-            print(f"  KL:    {avg_kl:.1f} {kl_status}")
+            print(f"  KL:    {avg_kl:.1f}")
             
-            # Save best model
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 unwrapped_model = accelerator.unwrap_model(model)
@@ -513,13 +547,11 @@ def main():
                 }, Path(config.output_dir) / 'best_model.pt')
                 print(f"  ✓ Saved Best")
             
-            # Periodic sampling
             if (epoch + 1) % config.sample_every == 0:
                 generate_samples(accelerator.unwrap_model(model), epoch + 1, config.output_dir, accelerator, 16)
                 visualize_reconstruction(accelerator.unwrap_model(model), dataloader, epoch + 1, config.output_dir, accelerator)
                 plot_losses(losses, config.output_dir, config)
             
-            # Periodic checkpoint
             if (epoch + 1) % config.save_every == 0:
                 unwrapped_model = accelerator.unwrap_model(model)
                 torch.save({
@@ -531,10 +563,7 @@ def main():
                 }, Path(config.output_dir) / f'checkpoint_{epoch+1:04d}.pt')
     
     if accelerator.is_main_process:
-        print("\n" + "="*80)
-        print("DONE!")
-        print(f"Final KL: {losses['kl'][-1]:.1f}")
-        print("="*80)
+        print("\nDONE!")
 
 if __name__ == "__main__":
     main()
