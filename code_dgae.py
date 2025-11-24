@@ -30,7 +30,8 @@ class Config:
     hidden_dims = [64, 128, 256, 512]
     
     num_epochs = 50
-    batch_size = 1
+    batch_size = 1 # Increased from 1
+    gradient_accumulation_steps = 1
     learning_rate = 1e-4
     
     # Loss Weights
@@ -217,6 +218,19 @@ class DGAE(nn.Module):
         self.vae.requires_grad_(False)
         self.unet.requires_grad_(False)
         
+        # Memory optimizations
+        if hasattr(self.vae, 'enable_slicing'):
+            self.vae.enable_slicing()
+        if hasattr(self.vae, 'enable_tiling'):
+            self.vae.enable_tiling()
+            
+        # Enable xformers if available
+        try:
+            self.unet.enable_xformers_memory_efficient_attention()
+            print("✓ Enabled xformers memory efficient attention")
+        except Exception as e:
+            print(f"Note: xformers not enabled: {e}")
+        
         self.perceptual_loss = PerceptualLoss()
         
     def reparameterize(self, mu, logvar):
@@ -340,7 +354,10 @@ def main():
     args = parser.parse_args()
     config.num_epochs = args.epochs
     
-    accelerator = Accelerator(mixed_precision=config.mixed_precision)
+    accelerator = Accelerator(
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps
+    )
     set_seed(config.seed)
     
     os.makedirs(config.output_dir, exist_ok=True)
