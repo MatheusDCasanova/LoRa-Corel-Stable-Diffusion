@@ -25,7 +25,7 @@ else:
 # Devem ser iguais aos nomes das pastas usados no treino.
 classes_to_test = ["royal guards", "train", "dessert", "vegetables", "snow", "sunset"]
 
-NUM_IMAGES_PER_CLASS = 2
+NUM_IMAGES_PER_CLASS = 50
 WIDTH = 512  # Corel geralmente fica melhor em 512 do que 256
 HEIGHT = 512
 SEED = 42
@@ -58,7 +58,7 @@ pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 # Loop pelas classes para provar que o modelo único funciona
 all_images = []
 
-for class_name in classes_to_test:
+for i, class_name in enumerate(classes_to_test):
     prompt = f"a photo of a {class_name}"
     negative_prompt = "low quality, blur, watermark, distortion, bad anatomy"
 
@@ -66,9 +66,9 @@ for class_name in classes_to_test:
     print(f"GENERATING CLASS: {class_name}")
     print(f"Prompt: {prompt}")
 
-    for i in range(NUM_IMAGES_PER_CLASS):
-        seed_val = SEED + i
-        print(f"  > Image {i+1}/{NUM_IMAGES_PER_CLASS} (Seed: {seed_val})")
+    for j in range(NUM_IMAGES_PER_CLASS):
+        seed_val = SEED + j
+        print(f"  > Image {j+1}/{NUM_IMAGES_PER_CLASS} (Seed: {seed_val})")
 
         image = pipe(
             prompt=prompt,
@@ -80,8 +80,8 @@ for class_name in classes_to_test:
             guidance_scale=7.5
         ).images[0]
 
-        timestamp = datetime.now().strftime("%H%M%S")
-        img_filename = f"{class_name}_{i+1}_{timestamp}.png"
+
+        img_filename = f"000{i+1}_gen_{j+1}.png"
         img_path = os.path.join(output_dir, img_filename)
 
         image.save(img_path)
