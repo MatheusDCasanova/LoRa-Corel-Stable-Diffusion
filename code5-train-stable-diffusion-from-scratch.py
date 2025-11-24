@@ -34,6 +34,9 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 import argparse
 
+# --- CONSTANTS ---
+LATENT_SCALE_FACTOR = 0.8
+
 # ============================================================================
 # VAE COMPONENTS (Matching code4-train-vae.py)
 # ============================================================================
@@ -522,7 +525,7 @@ def train_latent_diffusion(
     schedule_type='linear',
     resume_checkpoint=None,
     lr_scheduler='cosine_warm_restarts',
-    early_stopping_patience=30,
+    early_stopping_patience=100,
     seed=42
 ):
     # Initialize Accelerator
@@ -635,6 +638,9 @@ def train_latent_diffusion(
                 std = torch.exp(0.5 * logvar)
                 eps = torch.randn_like(std)
                 latents = mu + eps * std
+                
+                # Scale latents
+                latents = latents * LATENT_SCALE_FACTOR
             
             # Sample random timesteps
             t = torch.randint(0, schedule.timesteps, (latents.shape[0],), device=device).long()
@@ -769,6 +775,7 @@ def generate_samples(model, decoder, schedule, device, output_path, latent_dim=1
             latents = model_mean
             
     # Decode latents to images
+    latents = latents / LATENT_SCALE_FACTOR
     images = decoder(latents)
     
     save_image(images, output_path, nrow=2, normalize=True, value_range=(-1, 1))
@@ -782,7 +789,7 @@ def main():
     parser.add_argument('--vae-path', type=str, default='./vae_clean/best_model.pt')
     parser.add_argument('--data-dir', type=str, default='./corel')
     parser.add_argument('--output-dir', type=str, default='./latent_diffusion')
-    parser.add_argument('--epochs', type=int, default=500)
+    parser.add_argument('--epochs', type=int, default=600)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
     parser.add_argument('--resume', type=str, default=None)
