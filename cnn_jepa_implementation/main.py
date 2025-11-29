@@ -8,8 +8,8 @@ from cnn_jepa import CNNJEPA
 from masking import MaskCollator
 
 # Configuration
-BATCH_SIZE = 16
-EPOCHS = 300
+BATCH_SIZE = 32
+EPOCHS = 600
 LR = 0.01
 WEIGHT_DECAY = 0.01
 WARMUP_EPOCHS = 1  # Shortened for demo
@@ -89,7 +89,7 @@ def main():
 
     
     collator = MaskCollator(input_size=(IMAGE_SIZE, IMAGE_SIZE), patch_size=PATCH_SIZE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=collator, num_workers=4, shuffle=True, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=collator, num_workers=8, shuffle=True, drop_last=True)
     
     # Model
     model = CNNJEPA().to(device)
@@ -101,7 +101,7 @@ def main():
     total_steps = len(dataloader) * EPOCHS
     global_step = 0
 
-    save_path = "best_cnn_jepa" if not use_augmented else "best_cnn_jepa_augmented.pth"
+    save_path = "best_cnn_jepa" if not use_augmented else "best_cnn_jepa_augmented"
     
     best_loss = float('inf')
     print("Starting training...")
@@ -149,7 +149,7 @@ def main():
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), f"cnn_jepa_implementation/{save_path}_{epoch+1}.pth")
+            torch.save(model.state_dict(), f"cnn_jepa_implementation/{save_path}.pth")
             print(f"New best model saved with loss: {best_loss:.4f}")
 
 if __name__ == "__main__":

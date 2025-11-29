@@ -3,7 +3,8 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering, SpectralClustering
+from sklearn.mixture import GaussianMixture
 from sklearn.metrics import adjusted_rand_score, silhouette_score, davies_bouldin_score
 from sklearn.manifold import TSNE
 from umap import UMAP
@@ -63,20 +64,50 @@ def extract_features(model, dataloader, device):
     features = np.concatenate(features_list, axis=0)
     return features, labels_list
 
-def perform_clustering(features, n_clusters=10):
-    """Perform KMeans and DBSCAN clustering"""
+def perform_clustering(features, n_clusters=6):
+    """Perform multiple clustering algorithms"""
     print("\n" + "="*50)
     print("Performing clustering...")
     
-    # KMeans
+    # Normalize features
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    features_norm = features / (norms + 1e-10)
+    
+    results = {}
+    
+    # 1. KMeans
+    print("Running KMeans...")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    kmeans_labels = kmeans.fit_predict(features)
+    results['KMeans'] = kmeans.fit_predict(features_norm)
     
-    # DBSCAN (auto-determine clusters)
-    dbscan = DBSCAN(eps=5.0, min_samples=5)
-    dbscan_labels = dbscan.fit_predict(features)
+    # 2. Agglomerative
+    print("Running Agglomerative Clustering...")
+    agg = AgglomerativeClustering(n_clusters=n_clusters)
+    results['Agglomerative'] = agg.fit_predict(features_norm)
     
-    return kmeans_labels, dbscan_labels
+    # 3. Spectral
+    print("Running Spectral Clustering...")
+    # Use fewer components for spectral to be faster/stable if needed, or just raw
+    spectral = SpectralClustering(n_clusters=n_clusters, random_state=42, affinity='nearest_neighbors')
+    results['Spectral'] = spectral.fit_predict(features_norm)
+    
+    # 4. GMM
+    print("Running GMM...")
+    gmm = GaussianMixture(n_components=n_clusters, random_state=42)
+    results['GMM'] = gmm.fit_predict(features_norm)
+    
+    # 5. DBSCAN (with PCA)
+    print("Running DBSCAN...")
+    from sklearn.decomposition import PCA
+    pca = PCA(n_components=20)
+    features_pca = pca.fit_transform(features_norm)
+    norms_pca = np.linalg.norm(features_pca, axis=1, keepdims=True)
+    features_pca = features_pca / (norms_pca + 1e-10)
+    
+    dbscan = DBSCAN(eps=0.70, min_samples=10)
+    results['DBSCAN'] = dbscan.fit_predict(features_pca)
+    
+    return results
 
 def compute_metrics(features, pred_labels, true_labels):
     """Compute clustering metrics"""
@@ -148,6 +179,84 @@ def visualize_latent_space(features, labels, pred_labels, method='tsne', save_pa
     print(f"✓ Saved visualization: {save_path}")
     plt.close()
 
+def visualize_combined_clusters(features, labels, clustering_results, true_labels, save_path='clustering_comparison.png'):
+    """
+    Visualize Ground Truth and all clustering results in a grid.
+    Layout: 2x3 grid
+    - Ground Truth
+    - KMeans
+    - Agglomerative
+    - Spectral
+    - GMM
+    - DBSCAN
+    """
+    print(f"\n" + "="*50)
+    print(f"Generating combined visualization...")
+    
+    # Compute UMAP embedding once for all plots
+    reducer = UMAP(n_components=2, random_state=42)
+    embedded = reducer.fit_transform(features)
+    
+    # Prepare figure
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    axes = axes.flatten()
+    
+    # Helper to plot
+    def plot_embedding(ax, labels, title, ari=None):
+        unique_labels = sorted(list(set(labels)))
+        # Handle noise in DBSCAN (-1)
+        if -1 in unique_labels:
+            unique_labels.remove(-1)
+            unique_labels.append(-1)
+            
+        # Create color map
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        label_to_color = {l: c for l, c in zip(unique_labels, colors)}
+        if -1 in label_to_color:
+            label_to_color[-1] = (0.8, 0.8, 0.8, 1.0) # Grey for noise
+            
+        # Convert labels to colors
+        c = [label_to_color[l] for l in labels]
+        
+        ax.scatter(embedded[:, 0], embedded[:, 1], c=c, s=10, alpha=0.7)
+        
+        title_text = title
+        if ari is not None:
+            title_text += f"\nARI: {ari:.3f}"
+        
+        ax.set_title(title_text, fontsize=12, fontweight='bold')
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    # 1. Ground Truth
+    # Convert string labels to numeric for consistency if needed, but here we just need distinct values
+    plot_embedding(axes[0], true_labels, "Ground Truth")
+    
+    # 2. KMeans
+    ari = adjusted_rand_score(true_labels, clustering_results['KMeans'])
+    plot_embedding(axes[1], clustering_results['KMeans'], "K-means", ari)
+    
+    # 3. Agglomerative
+    ari = adjusted_rand_score(true_labels, clustering_results['Agglomerative'])
+    plot_embedding(axes[2], clustering_results['Agglomerative'], "Agglomerative", ari)
+    
+    # 4. Spectral
+    ari = adjusted_rand_score(true_labels, clustering_results['Spectral'])
+    plot_embedding(axes[3], clustering_results['Spectral'], "Spectral", ari)
+    
+    # 5. GMM
+    ari = adjusted_rand_score(true_labels, clustering_results['GMM'])
+    plot_embedding(axes[4], clustering_results['GMM'], "GMM", ari)
+    
+    # 6. DBSCAN
+    ari = adjusted_rand_score(true_labels, clustering_results['DBSCAN'])
+    plot_embedding(axes[5], clustering_results['DBSCAN'], "DBSCAN", ari)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved combined visualization: {save_path}")
+    plt.close()
+
 def plot_clustering_metrics(kmeans_metrics, dbscan_metrics, save_path='clustering_metrics.png'):
     """Plot clustering metrics comparison"""
     metrics_names = ['ARI', 'Silhouette', 'Davies-Bouldin']
@@ -184,7 +293,7 @@ def plot_clustering_metrics(kmeans_metrics, dbscan_metrics, save_path='clusterin
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, default='best_cnn_jepa.pth', help='Path to checkpoint')
-    parser.add_argument('--n_clusters', type=int, default=10, help='Number of clusters for KMeans')
+    parser.add_argument('--n_clusters', type=int, default=6, help='Number of clusters for KMeans')
     parser.add_argument('--output_dir', type=str, default='evaluation_results', help='Output directory')
     args = parser.parse_args()
     
@@ -218,51 +327,25 @@ def main():
     print(f"✓ Extracted features shape: {features.shape}")
     
     # Perform clustering
-    kmeans_labels, dbscan_labels = perform_clustering(features, n_clusters=args.n_clusters)
+    clustering_results = perform_clustering(features, n_clusters=args.n_clusters)
     
-    # Compute metrics
+    # Compute metrics for all methods
     print("\n" + "="*50)
-    print("KMEANS METRICS:")
-    kmeans_metrics = compute_metrics(features, kmeans_labels, labels)
-    for metric, value in kmeans_metrics.items():
-        print(f"  {metric}: {value:.4f}")
+    print("CLUSTERING METRICS:")
     
-    print("\n" + "="*50)
-    print("DBSCAN METRICS:")
-    dbscan_metrics = compute_metrics(features, dbscan_labels, labels)
-    for metric, value in dbscan_metrics.items():
-        print(f"  {metric}: {value:.4f}")
+    metrics_summary = {}
     
-    # Visualize with t-SNE
-    visualize_latent_space(
-        features, labels, kmeans_labels, 
-        method='tsne',
-        save_path=os.path.join(args.output_dir, 'latent_space_tsne_kmeans.png')
-    )
-    
-    visualize_latent_space(
-        features, labels, dbscan_labels, 
-        method='tsne',
-        save_path=os.path.join(args.output_dir, 'latent_space_tsne_dbscan.png')
-    )
-    
-    # Visualize with UMAP
-    visualize_latent_space(
-        features, labels, kmeans_labels, 
-        method='umap',
-        save_path=os.path.join(args.output_dir, 'latent_space_umap_kmeans.png')
-    )
-    
-    visualize_latent_space(
-        features, labels, dbscan_labels, 
-        method='umap',
-        save_path=os.path.join(args.output_dir, 'latent_space_umap_dbscan.png')
-    )
-    
-    # Plot metrics comparison
-    plot_clustering_metrics(
-        kmeans_metrics, dbscan_metrics,
-        save_path=os.path.join(args.output_dir, 'clustering_metrics.png')
+    for method, pred_labels in clustering_results.items():
+        print(f"\n{method.upper()}:")
+        metrics = compute_metrics(features, pred_labels, labels)
+        metrics_summary[method] = metrics
+        for metric, value in metrics.items():
+            print(f"  {metric}: {value:.4f}")
+            
+    # Visualize combined clusters
+    visualize_combined_clusters(
+        features, labels, clustering_results, labels,
+        save_path=os.path.join(args.output_dir, 'clustering_comparison.png')
     )
     
     print("\n" + "="*50)
